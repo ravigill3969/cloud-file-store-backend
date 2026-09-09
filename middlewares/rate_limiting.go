@@ -3,11 +3,13 @@ package middleware
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"time"
 
 	"backend/utils"
+
 	"github.com/redis/go-redis/v9"
 )
 
@@ -25,9 +27,11 @@ func GlobalRateLimiter(redisClient *redis.Client) func(http.Handler) http.Handle
 			allowed, err := checkRateLimit(redisClient, key)
 
 			if err != nil {
+				log.Printf("rate limiter Redis error: %v", err)
 				utils.RespondError(w, http.StatusInternalServerError, "Internal Error")
 				return
 			}
+
 			if !allowed {
 				utils.RespondError(w, http.StatusTooManyRequests, "Too many requests, wait for one minute!")
 				return
