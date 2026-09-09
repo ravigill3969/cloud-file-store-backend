@@ -133,7 +133,7 @@ func main() {
 
 	middleware := middleware.CORS(
 		middleware.SetCommonHeaders(
-			middleware.GlobalRateLimiter(redisClient)(mux),
+			mux,
 		),
 	)
 
