@@ -5,11 +5,8 @@ import (
 	"net/http"
 )
 
-func HealthRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /check", ht)
-}
 
-func ht(w http.ResponseWriter, r *http.Request) {
+func HT(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 

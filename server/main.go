@@ -122,7 +122,7 @@ func main() {
 	}()
 
 	mux.HandleFunc("/webhook", stripeHandler.HandleWebhook)
-	routes.HealthRoutes(mux)
+	mux.HandleFunc("/check", routes.HT)
 	routes.RegisterUserRoutes(mux, userHandler, redisClient)
 	routes.FileRoutes(mux, fileHandler, redisClient)
 	routes.StripeRoutes(mux, stripeHandler, redisClient)
