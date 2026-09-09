@@ -61,7 +61,7 @@ func main() {
 		fmt.Println("region is required")
 		return
 	}
-	
+
 	bucket := os.Getenv("AWS_BUCKET_NAME")
 
 	if bucket == " " {
@@ -122,6 +122,7 @@ func main() {
 	}()
 
 	mux.HandleFunc("/webhook", stripeHandler.HandleWebhook)
+	routes.HealthRoutes(mux)
 	routes.RegisterUserRoutes(mux, userHandler, redisClient)
 	routes.FileRoutes(mux, fileHandler, redisClient)
 	routes.StripeRoutes(mux, stripeHandler, redisClient)
