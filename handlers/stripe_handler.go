@@ -2,12 +2,11 @@ package handlers
 
 import (
 	"database/sql"
-	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	middleware "backend/middlewares"
 	"backend/utils"
@@ -16,6 +15,7 @@ import (
 	"github.com/stripe/stripe-go/v82"
 	"github.com/stripe/stripe-go/v82/checkout/session"
 	"github.com/stripe/stripe-go/v82/subscription"
+	"github.com/stripe/stripe-go/v82/webhook"
 )
 
 type Stripe struct {
@@ -24,34 +24,54 @@ type Stripe struct {
 	FrontendURL string
 }
 
-type metadataKey string
-
-const MetadataUserID metadataKey = "userID"
-
 func (s *Stripe) CreateCheckoutSession(w http.ResponseWriter, r *http.Request) {
-	stripe.Key = os.Getenv("STRIPE_KEY")
-	priceId := os.Getenv("STRIPE_PRICE_ID")
+	priceID := strings.TrimSpace(os.Getenv("STRIPE_PRICE_ID"))
+	if priceID == "" {
+		utils.RespondError(w, http.StatusInternalServerError, "Billing is not configured")
+		return
+	}
 
 	userID, ok := r.Context().Value(middleware.UserIDContextKey).(string)
-
-	if !ok {
+	if !ok || strings.TrimSpace(userID) == "" {
 		utils.RespondError(w, http.StatusUnauthorized, "Unauthorized: User ID not provided")
 		return
 	}
 
-	var CustomerId string
+	var customerID, subscriptionID, subscriptionStatus sql.NullString
+	var cancelAtPeriodEnd sql.NullBool
 
-	s.Db.QueryRow(`SELECT stripe_customer_id FROM stripe WHERE user_id = $1`, userID).Scan(&CustomerId)
+	err := s.Db.QueryRow(`
+		SELECT stripe_customer_id, stripe_subscription_id, subscription_status, cancel_at_period_end
+		FROM stripe
+		WHERE user_id = $1
+	`, userID).Scan(&customerID, &subscriptionID, &subscriptionStatus, &cancelAtPeriodEnd)
+	if err != nil && err != sql.ErrNoRows {
+		utils.RespondInternal(w, err, "Unable to look up billing account")
+		return
+	}
+
+	hasActiveSubscription := false
+	if subscriptionID.Valid && !cancelAtPeriodEnd.Bool {
+		switch subscriptionStatus.String {
+		case "active", "trialing", "past_due", "unpaid":
+			hasActiveSubscription = true
+		}
+	}
+	if hasActiveSubscription {
+		utils.RespondError(w, http.StatusConflict, "You already have an active subscription")
+		return
+	}
+
+	customerIDStr := strings.TrimSpace(customerID.String)
 
 	params := &stripe.CheckoutSessionParams{
-		SuccessURL: stripe.String((s.FrontendURL + "/success")),
-		CancelURL:  stripe.String((s.FrontendURL + "/cancel")),
-		Mode:       stripe.String(string(stripe.CheckoutSessionModeSubscription)),
-		// Customer:   stripe.String(string(CustomerId)),
-
+		SuccessURL:        stripe.String(s.FrontendURL + "/success?session_id={CHECKOUT_SESSION_ID}"),
+		CancelURL:         stripe.String(s.FrontendURL + "/cancel"),
+		Mode:              stripe.String(string(stripe.CheckoutSessionModeSubscription)),
+		ClientReferenceID: stripe.String(userID),
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
 			{
-				Price:    stripe.String(priceId),
+				Price:    stripe.String(priceID),
 				Quantity: stripe.Int64(1),
 			},
 		},
@@ -60,150 +80,125 @@ func (s *Stripe) CreateCheckoutSession(w http.ResponseWriter, r *http.Request) {
 				"userID": userID,
 			},
 		},
+		Metadata: map[string]string{
+			"userID": userID,
+		},
 	}
 
-	if CustomerId != "" {
-		params.Customer = &CustomerId
+	if customerIDStr != "" {
+		params.Customer = stripe.String(customerIDStr)
 	}
-
-	params.AddMetadata("userID", userID)
 
 	result, err := session.New(params)
-
 	if err != nil {
 		utils.RespondInternal(w, err, "Unable to create checkout session")
 		return
 	}
 
-	url := result.URL
-
-	utils.RespondSuccess(w, http.StatusOK, map[string]string{"checkout_url": url})
+	utils.RespondSuccess(w, http.StatusOK, map[string]string{"checkout_url": result.URL})
 }
 
 func (s *Stripe) CancelSubscription(w http.ResponseWriter, r *http.Request) {
 	userID, ok := r.Context().Value(middleware.UserIDContextKey).(string)
-
-	if !ok {
+	if !ok || strings.TrimSpace(userID) == "" {
 		utils.RespondError(w, http.StatusUnauthorized, "Unauthorized: User ID not provided")
 		return
 	}
 
-	var subscriptionID string
-
+	var subscriptionID sql.NullString
 	err := s.Db.QueryRow(`SELECT stripe_subscription_id FROM stripe WHERE user_id = $1`, userID).Scan(&subscriptionID)
-
 	if err != nil {
-
 		if err == sql.ErrNoRows {
 			utils.RespondError(w, http.StatusNotFound, "Subscription not found")
-
 		} else {
 			utils.RespondInternal(w, err, "Failed to fetch subscription")
 		}
 		return
 	}
+	if !subscriptionID.Valid || strings.TrimSpace(subscriptionID.String) == "" {
+		utils.RespondError(w, http.StatusNotFound, "Subscription not found")
+		return
+	}
 
-	stripe.Key = os.Getenv("STRIPE_KEY")
-
-	params := &stripe.SubscriptionParams{CancelAtPeriodEnd: stripe.Bool(true)}
-
-	_, err = subscription.Update(subscriptionID, params)
-
+	_, err = subscription.Update(subscriptionID.String, &stripe.SubscriptionParams{
+		CancelAtPeriodEnd: stripe.Bool(true),
+	})
 	if err != nil {
 		utils.RespondInternal(w, err, "Failed to set subscription cancel at period end")
 		return
 	}
 
-	_, err = s.Db.Exec(`
+	result, err := s.Db.Exec(`
 		UPDATE stripe
 		SET cancel_at_period_end = true, updated_at = now()
 		WHERE user_id = $1
 	`, userID)
-
 	if err != nil {
-		fmt.Println(err)
-
-		if err == sql.ErrNoRows {
-			utils.RespondInternal(w, err, "Unable to update subscription status")
-
-		} else {
-			utils.RespondInternal(w, err, "Failed to update subscription")
-		}
+		utils.RespondInternal(w, err, "Failed to update subscription")
 		return
 	}
 
-	utils.RespondSuccess(w, http.StatusOK, map[string]string{"status": "cancel_at_period_end"})
+	if affected, err := result.RowsAffected(); err == nil && affected == 0 {
+		utils.RespondError(w, http.StatusNotFound, "Subscription not found")
+		return
+	}
 
+	utils.RespondSuccess(w, http.StatusOK, map[string]any{
+		"status":               "cancel_at_period_end",
+		"cancel_at_period_end": true,
+	})
 }
 
 func (s *Stripe) HandleWebhook(w http.ResponseWriter, r *http.Request) {
-	const MaxBodyBytes = int64(65536)
-	r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
+	const maxBodyBytes = int64(65536)
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+
 	payload, err := io.ReadAll(r.Body)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading request body: %v\n", err)
+		log.Printf("webhook: error reading request body: %v", err)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 
-	event := stripe.Event{}
+	webhookSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
+	if webhookSecret == "" {
+		log.Printf("webhook: STRIPE_WEBHOOK_SECRET is not set, rejecting request")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
-	if err := json.Unmarshal(payload, &event); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to parse webhook body json: %v\n", err.Error())
+	event, err := webhook.ConstructEvent(payload, r.Header.Get("Stripe-Signature"), webhookSecret)
+	if err != nil {
+		log.Printf("webhook: signature verification failed: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	switch event.Type {
-
 	case "checkout.session.completed":
-		fmt.Println("session compledeted")
 		err = utils.HandlePaymentSessionCompleted(s.Db, event)
-		fmt.Println("created session completed")
-		if err != nil {
-			utils.RespondInternal(w, err, "Failed to mark session complete")
-			return
-		}
-		return
 
-	case "invoice.paid":
+	case "invoice.paid", "invoice.payment_succeeded":
+
 		err = utils.HandleInvoicePaid(s.Db, event)
-		fmt.Println("invoice paid")
-		if err != nil {
-			utils.RespondInternal(w, err, "Payment failed")
-			return
-		}
-		return
 
 	case "invoice.payment_failed":
-		fmt.Println("payment failed")
-		return
+		err = utils.HandleInvoicePaymentFailed(s.Db, event)
 
-	case "customer.subscription.updated":
-
-		err := utils.HandleSubscriptionUpdated(s.Db, event)
-
-		if err != nil {
-			utils.RespondInternal(w, err, "Unable to update subscription")
-			return
-		}
-
-		return
+	case "customer.subscription.created", "customer.subscription.updated":
+		err = utils.HandleSubscriptionUpdated(s.Db, event)
 
 	case "customer.subscription.deleted":
-
-		fmt.Println("I am also called")
-		err := utils.HandleSubscriptionDeleted(s.Db, event)
-
-		if err != nil {
-			utils.RespondInternal(w, err, "Unable to cancel subscription")
-			return
-		}
-
-		return
+		err = utils.HandleSubscriptionDeleted(s.Db, event)
 
 	default:
-		log.Printf("Unhandled event type: %s", event.Type)
+		log.Printf("webhook: unhandled event type: %s", event.Type)
+	}
+
+	if err != nil {
+		log.Printf("webhook: failed to handle %s event %s: %v", event.Type, event.ID, err)
+		http.Error(w, "webhook handler failed", http.StatusInternalServerError)
+		return
 	}
 
 	w.WriteHeader(http.StatusOK)

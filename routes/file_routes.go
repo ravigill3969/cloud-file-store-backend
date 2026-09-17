@@ -5,6 +5,7 @@ import (
 
 	"backend/handlers"
 	middleware "backend/middlewares"
+
 	"github.com/redis/go-redis/v9"
 )
 
@@ -12,7 +13,7 @@ func FileRoutes(mux *http.ServeMux, fh *handlers.FileHandler, redis *redis.Clien
 	authMw := &middleware.RedisStruct{
 		RedisClient: redis,
 	}
-	
+
 	mux.Handle("POST /api/file/edit/{id}/", authMw.AuthMiddleware(http.HandlerFunc(fh.HandleImageResizeRequestForUser)))
 
 	mux.Handle("POST /api/file/upload", authMw.AuthMiddleware(http.HandlerFunc(fh.UploadFilesWithGoRoutines)))
@@ -31,14 +32,13 @@ func FileRoutes(mux *http.ServeMux, fh *handlers.FileHandler, redis *redis.Clien
 	mux.HandleFunc("POST /api/file/edit/{id}/{publicKey}/secure/{secretKey}", fh.HandleImageResizeRequestForThirdParty)
 	mux.HandleFunc("DELETE /api/file/delete/{id}/{publicKey}/secure/{secretKey}", fh.DeleteImageForThirdParty)
 
-	mux.HandleFunc("POST /api/media/upload/{publicKey}/secure/{secretKey}", fh.UploadMediaForThirdParty)
+	// mux.HandleFunc("POST /api/media/upload/{publicKey}/secure/{secretKey}", fh.UploadMediaForThirdParty)
 	// Video Routes
 	mux.Handle("POST /api/video/upload", authMw.AuthMiddleware(http.HandlerFunc(fh.VideoUpload)))
 	mux.Handle("DELETE /api/video/delete", authMw.AuthMiddleware(http.HandlerFunc(fh.DeleteVideoWithUserID)))
 	mux.Handle("GET /api/video/get-all", authMw.AuthMiddleware(http.HandlerFunc(fh.GetAllVideosWithUserID)))
 
-	mux.HandleFunc("GET /api/video/watch/", fh.HandleMediaStreamingRequest)
+	mux.HandleFunc("GET /api/video/watch", fh.HandleMediaStreamingRequest)
 	mux.HandleFunc("POST /api/video/upload/{publicKey}/secure/{secretKey}", fh.UploadVideoForThirdParty)
 	mux.HandleFunc("DELETE /api/video/delete/{publicKey}/secure/{secretKey}/{vid}", fh.DeleteVideoForThirdParty)
 }
-	

@@ -122,39 +122,25 @@ func (fh *FileHandler) UploadAsThirdParty(w http.ResponseWriter, r *http.Request
 	secretKey := parsedURL[6]
 	publicKey := parsedURL[4]
 
-	row := fh.DB.QueryRow(`WITH user_data AS (
-    SELECT uuid, public_key, secret_key, username, email
-    FROM users
-    WHERE public_key = $1
-	),
-	updated AS (
-    UPDATE users
-    SET post_api_calls = post_api_calls - 1
-    WHERE public_key = $1 AND post_api_calls > 0
-    RETURNING post_api_calls
-	)
-	SELECT u.uuid, u.public_key, u.secret_key, u.username, u.email, up.post_api_calls
-	FROM user_data u
-	JOIN updated up ON true;
-	`, publicKey)
-
 	var user models.SecretKeyUploadUser
 
-	err = row.Scan(
+	err = fh.DB.QueryRow(`
+		SELECT uuid, public_key, secret_key, username, email
+		FROM users
+		WHERE public_key = $1
+	`, publicKey).Scan(
 		&user.ID,
 		&user.PublicKey,
 		&user.SecretKey,
 		&user.Username,
 		&user.Email,
-		&user.PostAPICalls,
 	)
-
-	if user.SecretKey != "" && secretKey != user.SecretKey {
+	if err != nil || secretKey != user.SecretKey {
 		utils.RespondError(w, http.StatusUnauthorized, "Invalid public or secret key")
 		return
 	}
-	if err != nil {
-		utils.RespondError(w, http.StatusUnauthorized, "Post req limit reached for this month")
+
+	if !fh.requirePostCall(w, user.ID.String()) {
 		return
 	}
 
@@ -247,7 +233,7 @@ func validateContentType(contentType string) error {
 
 		// Legacy / less common but still used
 		"image/bmp",
-		"image/x-ms-bmp", // sometimes BMP is reported this way
+		"image/x-ms-bmp", 
 		"image/tiff",
 
 		// Apple / mobile formats
@@ -347,7 +333,7 @@ func (fh *FileHandler) HandleImageResizeRequestForThirdParty(w http.ResponseWrit
 	var image Image
 
 	err = fh.DB.QueryRow(`
-        SELECT 
+        SELECT
             id, user_id, s3_key, original_filename, mime_type, file_size_bytes, upload_date, width, height, url FROM images WHERE id = $1 AND deleted = FALSE`, imageID).Scan(
 		&image.ID,
 		&image.UserID,
@@ -379,6 +365,7 @@ func (fh *FileHandler) HandleImageResizeRequestForThirdParty(w http.ResponseWrit
 	}
 
 	str, key, err := LamdaMagicHere(image.S3Key, widthStr, heightStr)
+	fmt.Println(err)
 	if err != nil {
 		utils.RespondError(w, http.StatusInternalServerError, "Image resize failed")
 		return
@@ -447,6 +434,8 @@ func (fh *FileHandler) HandleImageResizeRequestForThirdParty(w http.ResponseWrit
 		return
 	}
 	if rowsAffected == 0 {
+		_ = tx.Rollback()
+		err = fmt.Errorf("insufficient edit quota")
 		utils.RespondError(w, http.StatusForbidden, "Insufficient quota")
 		return
 	}
@@ -586,6 +575,31 @@ func (fh *FileHandler) enforceDailyImageLimit(ctx context.Context, userID string
 	return nil
 }
 
+func (fh *FileHandler) requirePostCall(w http.ResponseWriter, userID string) bool {
+	result, err := fh.DB.Exec(`
+		UPDATE users
+		SET post_api_calls = post_api_calls - 1
+		WHERE uuid = $1 AND post_api_calls > 0
+	`, userID)
+	if err != nil {
+		utils.RespondInternal(w, err, "Unable to check upload quota")
+		return false
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		utils.RespondInternal(w, err, "Unable to check upload quota")
+		return false
+	}
+
+	if affected == 0 {
+		utils.RespondError(w, http.StatusUnauthorized, "Post req limit reached for this month")
+		return false
+	}
+
+	return true
+}
+
 func (fh *FileHandler) uploadImageToS3(ctx context.Context, userID string, fileHeader *multipart.FileHeader) (models.UploadGoRoutines, error) {
 	var upload models.UploadGoRoutines
 
@@ -679,9 +693,10 @@ func (fh *FileHandler) uploadVideoToS3(ctx context.Context, userID string, fileH
 	key := fmt.Sprintf("media/video/%s/%d_%s", userID, time.Now().UnixNano(), fileHeader.Filename)
 
 	_, err = fh.S3Uploader.Upload(&s3manager.UploadInput{
-		Bucket: aws.String(fh.S3Bucket),
-		Key:    aws.String(key),
-		Body:   file,
+		Bucket:      aws.String(fh.S3Bucket),
+		Key:         aws.String(key),
+		Body:        file,
+		ContentType: aws.String(fileHeader.Header.Get("Content-Type")),
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to upload to S3: %w", err)
@@ -722,9 +737,10 @@ func (fh *FileHandler) uploadAudioToS3(ctx context.Context, userID string, fileH
 	key := fmt.Sprintf("media/audio/%s/%d_%s", userID, time.Now().UnixNano(), fileHeader.Filename)
 
 	_, err = fh.S3Uploader.Upload(&s3manager.UploadInput{
-		Bucket: aws.String(fh.S3Bucket),
-		Key:    aws.String(key),
-		Body:   file,
+		Bucket:      aws.String(fh.S3Bucket),
+		Key:         aws.String(key),
+		Body:        file,
+		ContentType: aws.String(fileHeader.Header.Get("Content-Type")),
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to upload to S3: %w", err)
@@ -762,6 +778,10 @@ func (fh *FileHandler) UploadMedia(w http.ResponseWriter, r *http.Request) {
 	userID, ok := r.Context().Value(middleware.UserIDContextKey).(string)
 	if !ok || userID == "" {
 		utils.RespondError(w, http.StatusUnauthorized, "Unauthorized: user id missing")
+		return
+	}
+
+	if !fh.requirePostCall(w, userID) {
 		return
 	}
 
@@ -863,6 +883,10 @@ func (fh *FileHandler) UploadFilesWithGoRoutines(w http.ResponseWriter, r *http.
 	userID, ok := r.Context().Value(middleware.UserIDContextKey).(string)
 	if !ok || userID == "" {
 		utils.RespondError(w, http.StatusUnauthorized, "Unauthorized: User ID not provided")
+		return
+	}
+
+	if !fh.requirePostCall(w, userID) {
 		return
 	}
 
@@ -1366,9 +1390,11 @@ func (fh *FileHandler) HandleImageResizeRequestForUser(w http.ResponseWriter, r 
 		return
 	}
 
-	userID := r.Context().Value(middleware.UserIDContextKey)
-
-	fmt.Println(userID)
+	userID, ok := r.Context().Value(middleware.UserIDContextKey).(string)
+	if !ok || userID == "" {
+		utils.RespondError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
 
 	imageID := parsedURL[4]
 	widthStr := r.URL.Query().Get("width")
@@ -1398,8 +1424,8 @@ func (fh *FileHandler) HandleImageResizeRequestForUser(w http.ResponseWriter, r 
 	var image Image
 
 	err = fh.DB.QueryRow(`
-        SELECT 
-            id, user_id, s3_key, original_filename, mime_type, file_size_bytes, upload_date, width, height, url FROM images WHERE id = $1 AND deleted = FALSE`, imageID).Scan(
+        SELECT
+            id, user_id, s3_key, original_filename, mime_type, file_size_bytes, upload_date, width, height, url FROM images WHERE id = $1 AND user_id = $2 AND deleted = FALSE`, imageID, userID).Scan(
 		&image.ID,
 		&image.UserID,
 		&image.S3Key,
@@ -1484,7 +1510,7 @@ func (fh *FileHandler) HandleImageResizeRequestForUser(w http.ResponseWriter, r 
 	res, err := tx.Exec(`
     UPDATE users
     SET edit_api_calls = edit_api_calls - 1
-    WHERE uuid = $1 
+    WHERE uuid = $1 AND edit_api_calls > 0
 `, userID)
 	if err != nil {
 		log.Println("Failed to decrement edit_api_calls:", err)
@@ -1499,6 +1525,9 @@ func (fh *FileHandler) HandleImageResizeRequestForUser(w http.ResponseWriter, r 
 		return
 	}
 	if rowsAffected == 0 {
+
+		_ = tx.Rollback()
+		err = fmt.Errorf("insufficient edit quota")
 		utils.RespondError(w, http.StatusForbidden, "Insufficient quota")
 		return
 	}
@@ -1669,6 +1698,10 @@ func (fh *FileHandler) VideoUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !fh.requirePostCall(w, userID) {
+		return
+	}
+
 	files := r.MultipartForm.File["video"]
 	if len(files) == 0 {
 		utils.RespondError(w, http.StatusBadRequest, "No video file provided")
@@ -1752,7 +1785,9 @@ func (fh *FileHandler) HandleMediaStreamingRequest(w http.ResponseWriter, r *htt
 		return
 	}
 
-	s3Key, err := fh.getMediaS3Key(vid)
+	fmt.Println(vid)
+
+	s3Key, mimeType, err := fh.getMediaInfo(vid)
 	if err != nil {
 		utils.RespondError(w, http.StatusNotFound, "Video not found")
 		return
@@ -1774,12 +1809,20 @@ func (fh *FileHandler) HandleMediaStreamingRequest(w http.ResponseWriter, r *htt
 	}
 	defer resp.Body.Close()
 
+	contentType := mimeType
+	if contentType == "" && resp.ContentType != nil {
+		contentType = *resp.ContentType
+	}
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+
 	if resp.ContentLength != nil {
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", *resp.ContentLength))
 	}
-	if resp.ContentType != nil {
-		w.Header().Set("Content-Type", *resp.ContentType)
-	}
+
+	w.Header().Set("Accept-Ranges", "bytes")
+
 	if resp.ContentRange != nil {
 		w.Header().Set("Content-Range", *resp.ContentRange)
 		w.WriteHeader(http.StatusPartialContent)
@@ -1787,11 +1830,8 @@ func (fh *FileHandler) HandleMediaStreamingRequest(w http.ResponseWriter, r *htt
 		w.WriteHeader(http.StatusOK)
 	}
 
-	w.Header().Set("Accept-Ranges", "bytes")
-
-	_, err = io.Copy(w, resp.Body)
-	if err != nil {
-		return
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("Error streaming video %s: %v", vid, err)
 	}
 }
 
@@ -1830,6 +1870,10 @@ func (fh *FileHandler) UploadVideoForThirdParty(w http.ResponseWriter, r *http.R
 	err := fh.DB.QueryRow(`SELECT uuid FROM users WHERE public_key = $1 AND secret_key = $2`, publicKey, secretKey).Scan(&userID)
 	if err != nil {
 		utils.RespondError(w, http.StatusUnauthorized, "Invalid keys")
+		return
+	}
+
+	if !fh.requirePostCall(w, userID.String()) {
 		return
 	}
 
@@ -1891,7 +1935,6 @@ func (fh *FileHandler) DeleteVideoForThirdParty(w http.ResponseWriter, r *http.R
 	utils.RespondSuccess(w, http.StatusOK, "video deleted successfully")
 }
 
-// UploadMediaForThirdParty handles media uploads (image/video/audio) for third-party integrations
 func (fh *FileHandler) UploadMediaForThirdParty(w http.ResponseWriter, r *http.Request) {
 	parsedUrl := strings.Split(r.URL.Path, "/")
 	if len(parsedUrl) < 7 {
@@ -1901,39 +1944,25 @@ func (fh *FileHandler) UploadMediaForThirdParty(w http.ResponseWriter, r *http.R
 	publicKey := parsedUrl[4]
 	secretKey := parsedUrl[6]
 
-	// Authenticate user and decrement API calls
-	row := fh.DB.QueryRow(`WITH user_data AS (
+	// Authenticate the user, then spend one post call.
+	var user models.SecretKeyUploadUser
+	err := fh.DB.QueryRow(`
 		SELECT uuid, public_key, secret_key, username, email
 		FROM users
 		WHERE public_key = $1
-	),
-	updated AS (
-		UPDATE users
-		SET post_api_calls = post_api_calls - 0
-		WHERE public_key = $1 AND post_api_calls = 0
-		RETURNING post_api_calls
-	)
-	SELECT u.uuid, u.public_key, u.secret_key, u.username, u.email, up.post_api_calls
-	FROM user_data u
-	JOIN updated up ON true;
-	`, publicKey)
-
-	var user models.SecretKeyUploadUser
-	err := row.Scan(
+	`, publicKey).Scan(
 		&user.ID,
 		&user.PublicKey,
 		&user.SecretKey,
 		&user.Username,
 		&user.Email,
-		&user.PostAPICalls,
 	)
-
-	if user.SecretKey != "" && secretKey != user.SecretKey {
+	if err != nil || secretKey != user.SecretKey {
 		utils.RespondError(w, http.StatusUnauthorized, "Invalid public or secret key")
 		return
 	}
-	if err != nil {
-		utils.RespondError(w, http.StatusUnauthorized, "Post req limit reached for this month")
+
+	if !fh.requirePostCall(w, user.ID.String()) {
 		return
 	}
 
@@ -2045,7 +2074,7 @@ func (fh *FileHandler) uploadImageForThirdParty(ctx context.Context, userID stri
 	cdnURL := fmt.Sprintf("%s/%s", fh.AWSCloudFrontDomain, key)
 
 	// Save to database
-	query := `INSERT INTO images (user_id, s3_key, original_filename, mime_type, file_size_bytes, url, cdn_url) 
+	query := `INSERT INTO images (user_id, s3_key, original_filename, mime_type, file_size_bytes, url, cdn_url)
 			  VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`
 
 	var imageID uuid.UUID
@@ -2066,7 +2095,7 @@ func (fh *FileHandler) uploadImageForThirdParty(ctx context.Context, userID stri
 	return url, nil
 }
 
-// uploadVideoForThirdPartyMedia handles video uploads for third-party integrations
+// uploadVideoForThirdPartyMedia handles video uploads for third-party
 func (fh *FileHandler) uploadVideoForThirdPartyMedia(ctx context.Context, userID string, fileHeader *multipart.FileHeader) (string, error) {
 	if fileHeader.Size > maxVideoUploadSizeBytes {
 		return "", fmt.Errorf("video size exceeds 50MB limit")
@@ -2105,7 +2134,7 @@ func (fh *FileHandler) uploadVideoForThirdPartyMedia(ctx context.Context, userID
 
 	// mux.HandleFunc("GET /api/media/watch?vid={video_id}", fh.HandleMediaStreamingRequest)
 
-	// waterwater
+	// nice nice
 
 	backend_url := fh.BACKEND_URL
 
@@ -2178,11 +2207,11 @@ func (fh *FileHandler) GetAllVideosWithUserID(w http.ResponseWriter, r *http.Req
 	defer rows.Close()
 
 	type VideoMetadata struct {
-		Vid              string `json:"vid"`
-		OriginalFilename string `json:"original_filename"`
-		MimeType         string `json:"mime_type"`
-		FileSizeBytes    int64  `json:"file_size_bytes"`
-		UploadDate time.Time `json:"upload_date"`
+		Vid              string    `json:"vid"`
+		OriginalFilename string    `json:"original_filename"`
+		MimeType         string    `json:"mime_type"`
+		FileSizeBytes    int64     `json:"file_size_bytes"`
+		UploadDate       time.Time `json:"upload_date"`
 	}
 
 	var videos []VideoMetadata
@@ -2228,13 +2257,16 @@ func (fh *FileHandler) saveMediaToDB(userId string, s3Key, filename, mimeType st
 	return id, nil
 }
 
-func (fh *FileHandler) getMediaS3Key(vid string) (string, error) {
+func (fh *FileHandler) getMediaInfo(vid string) (string, string, error) {
 	var s3Key string
-	err := fh.DB.QueryRow(`SELECT s3_key FROM videos WHERE id = $1`, vid).Scan(&s3Key)
+	var mimeType sql.NullString
+
+	err := fh.DB.QueryRow(`SELECT s3_key, mime_type FROM videos WHERE id = $1`, vid).Scan(&s3Key, &mimeType)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return s3Key, nil
+
+	return s3Key, strings.TrimSpace(mimeType.String), nil
 }
 
 func (fh *FileHandler) deleteMediaFromDB(vid string, userID string) error {

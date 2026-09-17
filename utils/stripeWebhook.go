@@ -25,6 +25,12 @@ const (
 	proEditAPICalls = 10
 )
 
+var revokePremiumStatuses = map[stripe.SubscriptionStatus]bool{
+	stripe.SubscriptionStatusUnpaid:            true,
+	stripe.SubscriptionStatusCanceled:          true,
+	stripe.SubscriptionStatusIncompleteExpired: true,
+}
+
 type sqlExecutor interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }
@@ -48,6 +54,29 @@ func applyUserPlan(exec sqlExecutor, userID, accountType string, postCalls, getC
 	}
 
 	return nil
+}
+
+func grantPremium(exec sqlExecutor, userID string) error {
+	return applyUserPlan(exec, userID, planTypePro, proPostAPICalls, proGetAPICalls, proEditAPICalls)
+}
+
+func revokePremium(exec sqlExecutor, userID string) error {
+	return applyUserPlan(exec, userID, planTypeBasic, basicPostAPICalls, basicGetAPICalls, basicEditAPICalls)
+}
+
+// nullString turns an empty string into SQL NULL, and a real value into a
+// normal string. Doing this in Go keeps the SQL free of NULLIF/COALESCE tricks.
+func nullString(value string) sql.NullString {
+	value = strings.TrimSpace(value)
+	return sql.NullString{String: value, Valid: value != ""}
+}
+
+// nullTime turns a unix timestamp into SQL NULL when Stripe did not send one.
+func nullTime(unixSeconds int64) sql.NullTime {
+	if unixSeconds <= 0 {
+		return sql.NullTime{}
+	}
+	return sql.NullTime{Time: time.Unix(unixSeconds, 0), Valid: true}
 }
 
 func extractUserIDFromInvoice(inv *stripe.Invoice) string {
@@ -117,6 +146,35 @@ func extractPriceIDFromInvoice(inv *stripe.Invoice) string {
 	return ""
 }
 
+func customerIDFromInvoice(inv *stripe.Invoice) string {
+	if inv == nil || inv.Customer == nil {
+		return ""
+	}
+	return strings.TrimSpace(inv.Customer.ID)
+}
+
+func customerIDFromSubscription(sub *stripe.Subscription) string {
+	if sub == nil || sub.Customer == nil {
+		return ""
+	}
+	return strings.TrimSpace(sub.Customer.ID)
+}
+
+// invoicePeriod returns the service period of an invoice. The line item period
+// is preferred because `period_start`/`period_end` on the invoice itself look
+// back one period for subscription invoices.
+func invoicePeriod(inv *stripe.Invoice) (time.Time, time.Time) {
+	if inv == nil {
+		return time.Time{}, time.Time{}
+	}
+
+	if inv.Lines != nil && len(inv.Lines.Data) > 0 && inv.Lines.Data[0].Period != nil {
+		return time.Unix(inv.Lines.Data[0].Period.Start, 0), time.Unix(inv.Lines.Data[0].Period.End, 0)
+	}
+
+	return time.Unix(inv.PeriodStart, 0), time.Unix(inv.PeriodEnd, 0)
+}
+
 func lookupUserIDByStripeRefs(db *sql.DB, customerID, subscriptionID string) (string, error) {
 	var userID string
 	if subscriptionID != "" {
@@ -151,13 +209,7 @@ func resolveUserIDForInvoice(db *sql.DB, inv *stripe.Invoice) (string, error) {
 		return userID, nil
 	}
 
-	customerID := ""
-	if inv != nil && inv.Customer != nil {
-		customerID = strings.TrimSpace(inv.Customer.ID)
-	}
-
-	subscriptionID := extractSubscriptionIDFromInvoice(inv)
-	userID, err := lookupUserIDByStripeRefs(db, customerID, subscriptionID)
+	userID, err := lookupUserIDByStripeRefs(db, customerIDFromInvoice(inv), extractSubscriptionIDFromInvoice(inv))
 	if err != nil {
 		return "", fmt.Errorf("could not resolve user for invoice: %w", err)
 	}
@@ -174,12 +226,7 @@ func resolveUserIDForSubscription(db *sql.DB, sub *stripe.Subscription) (string,
 		return userID, nil
 	}
 
-	customerID := ""
-	if sub.Customer != nil {
-		customerID = strings.TrimSpace(sub.Customer.ID)
-	}
-
-	userID, err := lookupUserIDByStripeRefs(db, customerID, strings.TrimSpace(sub.ID))
+	userID, err := lookupUserIDByStripeRefs(db, customerIDFromSubscription(sub), strings.TrimSpace(sub.ID))
 	if err != nil {
 		return "", fmt.Errorf("could not resolve user for subscription: %w", err)
 	}
@@ -187,11 +234,36 @@ func resolveUserIDForSubscription(db *sql.DB, sub *stripe.Subscription) (string,
 	return userID, nil
 }
 
+type stripeTxFunc func(tx *sql.Tx) error
+
+// withTx runs fn inside a database transaction, rolling back on any error.
+func withTx(db *sql.DB, fn stripeTxFunc) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin DB transaction: %w", err)
+	}
+
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit DB transaction: %w", err)
+	}
+
+	return nil
+}
+
 func HandleInvoicePaid(db *sql.DB, event stripe.Event) error {
 	var inv stripe.Invoice
-
 	if err := json.Unmarshal(event.Data.Raw, &inv); err != nil {
-		return fmt.Errorf("failed to parse invoice.payment_succeeded: %w", err)
+		return fmt.Errorf("failed to parse invoice paid event: %w", err)
+	}
+
+	if inv.Status != "" && inv.Status != stripe.InvoiceStatusPaid {
+		log.Printf("invoice paid: ignoring invoice %s with status %q", inv.ID, inv.Status)
+		return nil
 	}
 
 	userID, err := resolveUserIDForInvoice(db, &inv)
@@ -199,104 +271,140 @@ func HandleInvoicePaid(db *sql.DB, event stripe.Event) error {
 		return err
 	}
 
-	periodStart := time.Unix(inv.PeriodStart, 0)
-	periodEnd := time.Unix(inv.PeriodEnd, 0)
-	if inv.Lines != nil && len(inv.Lines.Data) > 0 && inv.Lines.Data[0].Period != nil {
-		periodStart = time.Unix(inv.Lines.Data[0].Period.Start, 0)
-		periodEnd = time.Unix(inv.Lines.Data[0].Period.End, 0)
-	}
-
-	customerID := ""
-	if inv.Customer != nil {
-		customerID = strings.TrimSpace(inv.Customer.ID)
-	}
-
+	periodStart, periodEnd := invoicePeriod(&inv)
+	customerID := customerIDFromInvoice(&inv)
 	subscriptionID := extractSubscriptionIDFromInvoice(&inv)
 	priceID := extractPriceIDFromInvoice(&inv)
 	if priceID == "" {
 		priceID = os.Getenv("STRIPE_PRICE_ID")
 	}
 
-	if err := applyUserPlan(db, userID, planTypePro, proPostAPICalls, proGetAPICalls, proEditAPICalls); err != nil {
-		return fmt.Errorf("failed to update user to pro: %w", err)
-	}
+	if err := withTx(db, func(tx *sql.Tx) error {
+		if err := grantPremium(tx, userID); err != nil {
+			return fmt.Errorf("failed to update user to pro: %w", err)
+		}
 
-	_, err = db.Exec(`
-		INSERT INTO stripe (
-			user_id,
-			stripe_customer_id,
-			stripe_subscription_id,
-			price_id,
-			subscription_status,
-			current_period_start,
-			current_period_end,
-			cancel_at_period_end
-		)
-		VALUES (
-			$1,
-			NULLIF($2, ''),
-			NULLIF($3, ''),
-			$4,
-			'active',
-			$5,
-			$6,
-			false
-		)
-		ON CONFLICT (user_id)
-		DO UPDATE SET
-			stripe_customer_id = COALESCE(NULLIF(EXCLUDED.stripe_customer_id, ''), stripe.stripe_customer_id),
-			stripe_subscription_id = COALESCE(NULLIF(EXCLUDED.stripe_subscription_id, ''), stripe.stripe_subscription_id),
-			price_id = EXCLUDED.price_id,
-			subscription_status = EXCLUDED.subscription_status,
-			current_period_start = EXCLUDED.current_period_start,
-			current_period_end = EXCLUDED.current_period_end,
-			cancel_at_period_end = EXCLUDED.cancel_at_period_end,
-			updated_at = now()
-	`, userID, customerID, subscriptionID, priceID, periodStart, periodEnd)
-	if err != nil {
-		return fmt.Errorf("failed to upsert stripe record: %w", err)
+		// One row per user, so "insert, or update the row that is already there".
+		// EXCLUDED is the row we tried to insert; stripe.* is the old row.
+		_, err := tx.Exec(`
+			INSERT INTO stripe (
+				user_id,
+				stripe_customer_id,
+				stripe_subscription_id,
+				price_id,
+				subscription_status,
+				current_period_start,
+				current_period_end,
+				cancel_at_period_end
+			)
+			VALUES ($1, $2, $3, $4, 'active', $5, $6, false)
+			ON CONFLICT (user_id)
+			DO UPDATE SET
+				subscription_status = 'active',
+				price_id = EXCLUDED.price_id,
+				current_period_start = EXCLUDED.current_period_start,
+				current_period_end = EXCLUDED.current_period_end,
+				canceled_at = NULL,
+				stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, stripe.stripe_customer_id),
+				stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, stripe.stripe_subscription_id),
+				updated_at = now()
+		`, userID, nullString(customerID), nullString(subscriptionID), priceID, periodStart, periodEnd)
+		if err != nil {
+			return fmt.Errorf("failed to save stripe record: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	log.Printf("invoice paid handled for user %s", userID)
 	return nil
 }
 
-func HandlePaymentSessionCompleted(db *sql.DB, event stripe.Event) error {
-	fmt.Println("createting session")
+func HandleInvoicePaymentFailed(db *sql.DB, event stripe.Event) error {
+	var inv stripe.Invoice
+	if err := json.Unmarshal(event.Data.Raw, &inv); err != nil {
+		return fmt.Errorf("failed to parse invoice.payment_failed: %w", err)
+	}
 
-	var session stripe.CheckoutSession
-	err := json.Unmarshal(event.Data.Raw, &session)
+	userID, err := resolveUserIDForInvoice(db, &inv)
 	if err != nil {
-		return fmt.Errorf("something went wrong")
+		return err
+	}
 
+	customerID := customerIDFromInvoice(&inv)
+	subscriptionID := extractSubscriptionIDFromInvoice(&inv)
+	finalFailure := inv.NextPaymentAttempt == 0
+
+	return withTx(db, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`
+			UPDATE stripe
+			SET subscription_status = 'past_due',
+				stripe_customer_id = COALESCE($1, stripe_customer_id),
+				stripe_subscription_id = COALESCE($2, stripe_subscription_id),
+				updated_at = now()
+			WHERE user_id = $3
+		`, nullString(customerID), nullString(subscriptionID), userID)
+		if err != nil {
+			return fmt.Errorf("failed to mark stripe record past_due: %w", err)
+		}
+
+		if !finalFailure {
+			log.Printf("invoice payment failed for user %s, next retry at %d", userID, inv.NextPaymentAttempt)
+			return nil
+		}
+
+		if err := revokePremium(tx, userID); err != nil {
+			return fmt.Errorf("failed to downgrade user to basic: %w", err)
+		}
+
+		log.Printf("invoice payment permanently failed for user %s", userID)
+		return nil
+	})
+}
+
+func HandlePaymentSessionCompleted(db *sql.DB, event stripe.Event) error {
+	var session stripe.CheckoutSession
+	if err := json.Unmarshal(event.Data.Raw, &session); err != nil {
+		return fmt.Errorf("failed to parse checkout.session.completed: %w", err)
 	}
-	userID := session.Metadata["userID"]
-	priceId := os.Getenv("STRIPE_PRICE_ID")
-	subscriptionID := ""
-	if session.Subscription != nil {
-		subscriptionID = strings.TrimSpace(session.Subscription.ID)
+
+	userID := strings.TrimSpace(session.Metadata["userID"])
+	if userID == "" {
+		userID = strings.TrimSpace(session.ClientReferenceID)
 	}
+	if userID == "" {
+		return fmt.Errorf("userID not found in checkout session metadata")
+	}
+
 	customerID := ""
 	if session.Customer != nil {
 		customerID = strings.TrimSpace(session.Customer.ID)
 	}
 
-	if strings.TrimSpace(userID) == "" {
-		return fmt.Errorf("userID not found in checkout session metadata")
+	subscriptionID := ""
+	if session.Subscription != nil {
+		subscriptionID = strings.TrimSpace(session.Subscription.ID)
 	}
 
-	_, err = db.Exec(`
+	priceID := os.Getenv("STRIPE_PRICE_ID")
+
+	_, err := db.Exec(`
 		INSERT INTO stripe (user_id, stripe_customer_id, stripe_subscription_id, price_id)
-		VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), $4)
+		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (user_id)
 		DO UPDATE SET
-			stripe_customer_id = COALESCE(NULLIF(EXCLUDED.stripe_customer_id, ''), stripe.stripe_customer_id),
-			stripe_subscription_id = COALESCE(NULLIF(EXCLUDED.stripe_subscription_id, ''), stripe.stripe_subscription_id),
+			stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, stripe.stripe_customer_id),
+			stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, stripe.stripe_subscription_id),
 			price_id = EXCLUDED.price_id,
 			updated_at = now()
-	`, userID, customerID, subscriptionID, priceId)
+	`, userID, nullString(customerID), nullString(subscriptionID), priceID)
+	if err != nil {
+		return fmt.Errorf("failed to save stripe record: %w", err)
+	}
 
-	return err
+	return nil
 }
 
 func HandleSubscriptionUpdated(db *sql.DB, event stripe.Event) error {
@@ -305,30 +413,39 @@ func HandleSubscriptionUpdated(db *sql.DB, event stripe.Event) error {
 		return fmt.Errorf("failed to parse subscription.updated: %w", err)
 	}
 
-	customerID := ""
-	if sub.Customer != nil {
-		customerID = strings.TrimSpace(sub.Customer.ID)
-	}
-
-	if customerID == "" && strings.TrimSpace(sub.ID) == "" {
-		return fmt.Errorf("subscription.updated missing identifiers")
-	}
-
-	status := string(sub.Status)
-
-	_, err := db.Exec(`
-		UPDATE stripe
-		SET subscription_status = $1,
-			cancel_at_period_end = $2,
-			canceled_at = CASE WHEN $2 = true THEN now() ELSE NULL END
-		WHERE stripe_customer_id = $3 OR stripe_subscription_id = $4
-	`, status, sub.CancelAtPeriodEnd, customerID, sub.ID)
-
+	userID, err := resolveUserIDForSubscription(db, &sub)
 	if err != nil {
-		return fmt.Errorf("failed to update stripe record: %w", err)
+		log.Printf("subscription updated: %v", err)
+		return nil
 	}
 
-	return nil
+	canceledAt := nullTime(sub.CanceledAt)
+
+	customerID := customerIDFromSubscription(&sub)
+
+	return withTx(db, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`
+			UPDATE stripe
+			SET subscription_status = $1,
+				cancel_at_period_end = $2,
+				canceled_at = $3,
+				stripe_customer_id = COALESCE($4, stripe_customer_id),
+				stripe_subscription_id = COALESCE($5, stripe_subscription_id),
+				updated_at = now()
+			WHERE user_id = $6
+		`, string(sub.Status), sub.CancelAtPeriodEnd, canceledAt, nullString(customerID), nullString(sub.ID), userID)
+		if err != nil {
+			return fmt.Errorf("failed to update stripe record: %w", err)
+		}
+
+		if revokePremiumStatuses[sub.Status] {
+			if err := revokePremium(tx, userID); err != nil {
+				return fmt.Errorf("failed to downgrade user to basic: %w", err)
+			}
+		}
+
+		return nil
+	})
 }
 
 func HandleSubscriptionDeleted(db *sql.DB, event stripe.Event) error {
@@ -342,33 +459,32 @@ func HandleSubscriptionDeleted(db *sql.DB, event stripe.Event) error {
 		return err
 	}
 
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin DB transaction: %w", err)
+	canceledAt := time.Now()
+	if sub.CanceledAt > 0 {
+		canceledAt = time.Unix(sub.CanceledAt, 0)
 	}
-	defer func() {
+
+	customerID := customerIDFromSubscription(&sub)
+
+	return withTx(db, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`
+			UPDATE stripe
+			SET subscription_status = 'canceled',
+				cancel_at_period_end = false,
+				canceled_at = $1,
+				stripe_customer_id = COALESCE($2, stripe_customer_id),
+				stripe_subscription_id = COALESCE($3, stripe_subscription_id),
+				updated_at = now()
+			WHERE user_id = $4
+		`, canceledAt, nullString(customerID), nullString(sub.ID), userID)
 		if err != nil {
-			_ = tx.Rollback()
-		} else {
-			_ = tx.Commit()
+			return fmt.Errorf("failed to update stripe record: %w", err)
 		}
-	}()
 
-	_, err = tx.Exec(`
-		UPDATE stripe
-		SET subscription_status = 'canceled',
-			cancel_at_period_end = false,
-			canceled_at = now()
-		WHERE user_id = $1
-	`, userID)
-	if err != nil {
-		return fmt.Errorf("failed to update stripe record: %w", err)
-	}
+		if err := revokePremium(tx, userID); err != nil {
+			return fmt.Errorf("failed to downgrade user to basic: %w", err)
+		}
 
-	err = applyUserPlan(tx, userID, planTypeBasic, basicPostAPICalls, basicGetAPICalls, basicEditAPICalls)
-	if err != nil {
-		return fmt.Errorf("failed to downgrade user to basic: %w", err)
-	}
-
-	return nil
+		return nil
+	})
 }
