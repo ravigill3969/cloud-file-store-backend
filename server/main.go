@@ -21,10 +21,18 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
+	"github.com/stripe/stripe-go/v82"
 )
 
 func main() {
 	_ = godotenv.Load(".env")
+
+	// stripe.Key is a package level global, so set it once here instead of on
+	// every request (which would be a data race).
+	stripe.Key = os.Getenv("STRIPE_KEY")
+	if stripe.Key == "" {
+		log.Fatal("STRIPE_KEY is required")
+	}
 
 	db, err := database.ConnectDB()
 
