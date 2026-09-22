@@ -140,9 +140,7 @@ func main() {
 	})
 
 	middleware := middleware.CORS(
-		middleware.SetCommonHeaders(
 			mux,
-		),
 	)
 
 	fmt.Printf("server is running on http://localhost:%s\n", PORT)

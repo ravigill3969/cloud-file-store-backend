@@ -7,7 +7,11 @@ func CORS(next http.Handler) http.Handler {
 		origin := r.Header.Get("Origin")
 
 		allowedOrigins := map[string]bool{
-			"https://cloud-stash.com": true,
+			"https://cloud-stash.com":     true,
+			"https://www.cloud-stash.com": true,
+			"https://iloverher.com":       true,
+			"https://www.iloverher.com":   true,
+			"http://localhost:5173":       true,
 		}
 
 		if allowedOrigins[origin] {
@@ -25,7 +29,6 @@ func CORS(next http.Handler) http.Handler {
 			"Content-Type, Authorization",
 		)
 
-		w.Header().Set("Access-Control-Allow-Private-Network", "true")
 		w.Header().Set("Vary", "Origin")
 
 		if r.Method == http.MethodOptions {
