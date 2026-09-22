@@ -7,7 +7,7 @@ func CORS(next http.Handler) http.Handler {
 
 		origin := r.Header.Get("Origin")
 
-		if origin == "https://clouf-file-store-new-frontend.gill1122ravi.workers.dev" {
+		if origin == "https://cloud-stash.com" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
