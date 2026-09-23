@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stripe/stripe-go/v82"
+	"github.com/stripe/stripe-go/v85"
 )
 
 const (
@@ -64,14 +64,11 @@ func revokePremium(exec sqlExecutor, userID string) error {
 	return applyUserPlan(exec, userID, planTypeBasic, basicPostAPICalls, basicGetAPICalls, basicEditAPICalls)
 }
 
-// nullString turns an empty string into SQL NULL, and a real value into a
-// normal string. Doing this in Go keeps the SQL free of NULLIF/COALESCE tricks.
 func nullString(value string) sql.NullString {
 	value = strings.TrimSpace(value)
 	return sql.NullString{String: value, Valid: value != ""}
 }
 
-// nullTime turns a unix timestamp into SQL NULL when Stripe did not send one.
 func nullTime(unixSeconds int64) sql.NullTime {
 	if unixSeconds <= 0 {
 		return sql.NullTime{}
@@ -136,10 +133,14 @@ func extractPriceIDFromInvoice(inv *stripe.Invoice) string {
 	}
 
 	for _, line := range inv.Lines.Data {
-		if line.Pricing != nil && line.Pricing.PriceDetails != nil {
-			if priceID := strings.TrimSpace(line.Pricing.PriceDetails.Price); priceID != "" {
-				return priceID
-			}
+		// In stripe-go v85 PriceDetails.Price is a *Price instead of a plain ID
+		// string, and it can be nil, so it needs its own check.
+		if line.Pricing == nil || line.Pricing.PriceDetails == nil || line.Pricing.PriceDetails.Price == nil {
+			continue
+		}
+
+		if priceID := strings.TrimSpace(line.Pricing.PriceDetails.Price.ID); priceID != "" {
+			return priceID
 		}
 	}
 
@@ -160,9 +161,6 @@ func customerIDFromSubscription(sub *stripe.Subscription) string {
 	return strings.TrimSpace(sub.Customer.ID)
 }
 
-// invoicePeriod returns the service period of an invoice. The line item period
-// is preferred because `period_start`/`period_end` on the invoice itself look
-// back one period for subscription invoices.
 func invoicePeriod(inv *stripe.Invoice) (time.Time, time.Time) {
 	if inv == nil {
 		return time.Time{}, time.Time{}
@@ -284,8 +282,6 @@ func HandleInvoicePaid(db *sql.DB, event stripe.Event) error {
 			return fmt.Errorf("failed to update user to pro: %w", err)
 		}
 
-		// One row per user, so "insert, or update the row that is already there".
-		// EXCLUDED is the row we tried to insert; stripe.* is the old row.
 		_, err := tx.Exec(`
 			INSERT INTO stripe (
 				user_id,

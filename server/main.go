@@ -21,7 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
-	"github.com/stripe/stripe-go/v82"
+	"github.com/stripe/stripe-go/v85"
 )
 
 func main() {

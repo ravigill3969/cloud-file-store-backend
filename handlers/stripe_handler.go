@@ -12,10 +12,10 @@ import (
 	"backend/utils"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/stripe/stripe-go/v82"
-	"github.com/stripe/stripe-go/v82/checkout/session"
-	"github.com/stripe/stripe-go/v82/subscription"
-	"github.com/stripe/stripe-go/v82/webhook"
+	"github.com/stripe/stripe-go/v85"
+	"github.com/stripe/stripe-go/v85/checkout/session"
+	"github.com/stripe/stripe-go/v85/subscription"
+	"github.com/stripe/stripe-go/v85/webhook"
 )
 
 type Stripe struct {
