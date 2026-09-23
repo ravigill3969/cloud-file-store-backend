@@ -11,7 +11,7 @@ func CORS(next http.Handler) http.Handler {
 
 		log.Printf("CORS origin=%q", origin)
 
-		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
+		w.Header().Set("Access-Control-Allow-Origin", "https://cloud-stash.com")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		w.Header().Set(
 			"Access-Control-Allow-Methods",
